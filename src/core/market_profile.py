@@ -103,7 +103,8 @@ TW_PROFILE = MarketProfile(
     ],
     prompt_index_hint="分析台湾加权指数、柜买指数走势；缺失指数时说明覆盖范围，不推断未提供的行情",
     has_market_stats=False,
-    has_sector_rankings=False,
+    # 上市类股涨跌排行来自证交所 MI_INDEX 开放资料（TwSectorFetcher，fail-open）。
+    has_sector_rankings=True,
 )
 
 

@@ -93,7 +93,7 @@ PY
 
 当前阶段支持手动输入台湾股票的 Yahoo Finance 后缀代码，进入既有个股分析、历史保存、报告渲染、DecisionSignal、Portfolio 和 Intelligence 链路。TWSE 上市股票使用 `.TW` 后缀，TPEx 上柜（柜买）股票使用 `.TWO` 后缀，二者折叠为同一 `tw` 市场标签。
 
-近期台股链路已从早期 MVP 收敛为一等个股分析市场：市场识别、数据路由、交易日历/市场阶段、YFinance 日线与基础行情、主要指数、服务层/API/Web 市场枚举、TWD 币种标注、三大法人报告区块与 LLM prompt 消费均已接入。仍需保留的边界是：台股股票池种子/自动补全、Market Light 大盘红绿灯告警和完整台股市场宽度/板块排行尚未纳入。
+近期台股链路已从早期 MVP 收敛为一等个股分析市场：市场识别、数据路由、交易日历/市场阶段、YFinance 日线与基础行情、主要指数、服务层/API/Web 市场枚举、TWD 币种标注、三大法人报告区块与 LLM prompt 消费均已接入。仍需保留的边界是：台股股票池种子/自动补全、Market Light 大盘红绿灯告警和完整台股市场宽度尚未纳入；类股排行仅涵盖证交所上市类股指数。
 
 支持格式：
 
@@ -105,7 +105,9 @@ PY
 
 - **严格 suffix-only**：裸 `2330`、`00878` 等不带后缀的代码不会进入台股语义（`detect_market` / `get_market_for_stock` 仅在显式 `.TW`/`.TWO` 后缀时返回 `tw`）。当前未内置台股股票索引/种子解析，Web 自动补全不承诺完整台股股票池；未命中时请手动输入完整 suffix 代码。
 - 台股日线和基础实时/近实时行情只走 `YfinanceFetcher`，不尝试 AkShare、Tushare、Efinance、Pytdx、Baostock 等 A 股专属数据源。
-- 基本面复用既有 offshore yfinance 轻量路径；`institution` 区块额外消费台股三大法人资料并渲染到报告，A 股专属资金流、龙虎榜、板块等能力按 `not_supported` 降级。
+- 基本面复用既有 offshore yfinance 轻量路径；`institution` 区块额外消费台股三大法人资料并渲染到报告，龙虎榜按 `not_supported` 降级。
+- 台股资金流向（`capital_flow`）：以三大法人合计净买卖超的近 1 / 5 / 10 个交易日累计（单位：**股**，非金额）映射到 `stock_flow.main_net_inflow / inflow_5d / inflow_10d`，并带 `basis=tw_institutional_net`、`unit=shares` 标记；报告 Prompt 使用独立的「台股资金流向」表，不复用 A 股「主力资金」措辞。更早交易日由 `TwInstitutionalFetcher` 的后台线程按日期逐日载入 T86 全市场表（每个最新交易日只载入一次、全部个股共用）；窗口未完整载入时对应字段为 `None`，不输出部分合计，因此一次运行的前一两只台股可能只有近 1 日数据（可调大 `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS` 让首只个股等待）。上柜（`.TWO`）仅有近 1 日。台湾没有 A 股口径的主力资金或类股净流入数据，`capital_flow.sector_rankings` 保持为空。
+- 台股类股排行（`boards`）：`TwSectorFetcher`（`data_provider/tw_sector_fetcher.py`）读取证交所 OpenAPI `MI_INDEX` 类股指数涨跌幅，并在同一交易日可用时合并 `BFIAMU` 成交金额计算成交比重（`amount_share_pct`，不是净流入）。仅涵盖上市类股，排除报酬/杠杆/反向指数与电子工业等合成母类；不含上柜类股与概念题材。任一接口失败均 fail-open 回到 `not_supported`。
 - 报告 Prompt 已增加台股市场语义（新台币、三大法人、TWSE/TPEx ±10% 涨跌停），并将三大法人净买卖超注入 LLM 分析上下文，避免套用 A 股北向资金、龙虎榜等概念。
 - 交易日历注册 `tw: XTAI / Asia/Taipei`。TWSE 为 09:00–13:30 连续交易、无午休；收盘集合竞价 13:25–13:30 已按 5 分钟启发式窗口建模（`_CLOSING_AUCTION_WINDOW_MINUTES["tw"]=5`，`market_phase` 可返回 `closing_auction`）。JP/KR 也已按常规交易时段补齐收盘集合竞价窗口（JP 15:25-15:30、KR 15:20-15:30）。若本地 `exchange-calendars` 版本缺少对应日历，既有 fail-open/fail-closed 语义保持不变。
 - 主要指数提供加权指数 `^TWII` 与柜买指数 `^TWOII`。
@@ -127,7 +129,7 @@ PY
 - 设置 `MARKET_REVIEW_REGION=tw`，或在首页大盘复盘市场选择器勾选台股。支持 `cn,tw` 等子集，API `POST /api/v1/analysis/market-review` 可传 `{"region":"tw"}` 作为单次覆盖，不改写全局配置。
 - 复用已有 YFinance 主指数路由：加权指数 `TWII` / `^TWII`、柜买指数 `TWOII` / `^TWOII`，以及现有新闻检索。未新增行情源、凭证或外部 API 兼容规则。
 - 使用独立台股 profile、策略与新闻关键词；支持中英文报告和韩文 LLM 输出指令。行情可能延迟，单项失败时报告和分享图片会明确标出缺失的指数，图片保留所有“数据边界”章节的限制项（含历史记录与组合市场），不因已有章节或两项截断而丢失提示；全部失败时仅保留可用新闻/模板，不生成 A 股替代报告，也不把无数据判断为震荡。
-- 不提供市场宽度、涨跌停统计、三大法人资金流、成交额汇总、行业/概念排行、Market Light 评分或告警；成交额缺失显示 `N/A`，金额单位为新台币。
+- 不提供市场宽度、涨跌停统计、三大法人资金流、成交额汇总、概念题材排行、上柜类股排行、Market Light 评分或告警；成交额缺失显示 `N/A`，金额单位为新台币。
 - 启用交易日检查时，按既有 `XTAI / Asia/Taipei` 日历过滤台股；即使 A 股休市，选中的台股仍可独立执行。历史记录、通知、每日市场上下文与分享图片保留 `tw` 标签。
 - `both` 表示全部六市场 `cn,hk,us,jp,kr,tw`，增加台股数据/新闻/LLM 调用及耗时；要保留旧范围请显式配置 `cn,hk,us,jp,kr`。默认仍为 `cn`，不会自动改写历史配置。
 

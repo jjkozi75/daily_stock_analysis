@@ -384,7 +384,7 @@ Assess Taiwan market risk from available TAIEX/TPEx index data and verified news
 ### Strategy Principles
 - Check index coverage before comparing TAIEX and TPEx direction.
 - Distinguish semiconductor heavyweight signals from smaller-company themes.
-- Do not invent institutional flows, breadth, aggregate turnover, or sector rankings.
+- Do not invent institutional flows, breadth, or aggregate turnover; use only the TWSE sector ranking provided.
 
 ### Analysis Dimensions
 - Index Structure: assess trend and divergence only for indices with available data.
@@ -528,7 +528,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             return """### 6. Strategy Framework
 - **Index Structure**: Assess TAIEX/TPEx direction using available data; disclose missing coverage.
 - **News Catalysts**: Follow verified semiconductor, export-chain, and global technology news.
-- **Data Limits**: No market breadth, institutional flows, aggregate turnover, or sector rankings.
+- **Data Limits**: No market breadth, institutional flows, or aggregate turnover; sectors cover TWSE-listed industry indices only.
 """
         if self.region == "hk" and review_language == "en":
             return """### 6. Strategy Framework
@@ -603,7 +603,8 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # 3. 获取板块涨跌榜（A 股有，美股暂无）
         if self.profile.has_sector_rankings:
             self._get_sector_rankings(overview)
-            self._get_concept_rankings(overview)
+            if self.region != "tw":  # 台股没有概念题材榜
+                self._get_concept_rankings(overview)
         
         # 4. 获取北向资金（可选）
         # self._get_north_flow(overview)
@@ -690,7 +691,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         try:
             logger.info("[大盘] %s action=get_sector_rankings status=start", self._log_context())
 
-            top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
+            if self.region == "tw":
+                # 台股：证交所上市类股指数涨跌排行（fail-open，取不到时返回空）
+                from data_provider.tw_sector_fetcher import get_tw_sector_fetcher
+
+                rankings = get_tw_sector_fetcher().get_sector_rankings(5)
+                top_sectors, bottom_sectors = rankings if rankings else ([], [])
+            else:
+                top_sectors, bottom_sectors = self.data_manager.get_sector_rankings(5)
 
             if top_sectors or bottom_sectors:
                 overview.top_sectors = top_sectors
@@ -936,6 +944,21 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             self._log_context(),
         )
         return self._with_tw_index_coverage(self._generate_template_review(overview, news), overview)
+
+    def _format_tw_turnover_share(self, overview: MarketOverview) -> str:
+        """成交比重 of the ranked Taiwan sectors (only items that carry it)."""
+        parts = []
+        seen = set()
+        for item in list(overview.top_sectors or []) + list(overview.bottom_sectors or []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            share = item.get("amount_share_pct")
+            if not name or name in seen or not isinstance(share, (int, float)):
+                continue
+            seen.add(name)
+            parts.append(f"{name} {share:.2f}%")
+        return (", " if self._get_review_language() == "en" else "、").join(parts)
 
     def _tw_index_coverage_lines(self, overview: MarketOverview) -> List[str]:
         """Keep missing Taiwan index coverage explicit even when an LLM omits it."""
@@ -1658,8 +1681,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 (Interpret only the provided turnover, participation, breadth, and flow signals.)""")
                 section_number += 1
             if self.profile.has_sector_rankings:
+                sector_hint = (
+                    "(Analyze only the provided TWSE sector ranking and turnover share; "
+                    "turnover share is not a net inflow.)"
+                    if self.region == "tw"
+                    else "(Analyze only the provided industry-sector and concept/theme rankings.)"
+                )
                 sections.append(f"""### {section_number}. Sector Highlights
-(Analyze only the provided industry-sector and concept/theme rankings.)""")
+{sector_hint}""")
                 section_number += 1
             sections.extend([
                 f"""### {section_number}. News Catalysts
@@ -1698,7 +1727,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             sections.append(f"### {numerals[section_number - 1]}、{title}\n{hint}")
             section_number += 1
 
-        if self.profile.has_sector_rankings:
+        if self.profile.has_sector_rankings and self.region == "tw":
+            add_section("类股主线", "（仅分析已提供的上市类股涨跌排行与成交比重；成交比重不是净流入，不扩展未提供的数据）")
+        elif self.profile.has_sector_rankings:
             add_section("板块主线", "（仅分析已提供的行业板块与概念题材榜单，不扩展未提供的数据）")
         if self.profile.has_market_stats:
             add_section("资金与情绪", "（仅解读已提供的成交额、涨跌停结构、市场宽度和风险偏好数据）")
@@ -1754,7 +1785,12 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
 - Limit-up: {overview.limit_up_count} | Limit-down: {overview.limit_down_count}
 - Turnover: {overview.total_amount:.0f} ({self._get_turnover_unit_label()})"""
 
-            if self.profile.has_sector_rankings:
+            if self.profile.has_sector_rankings and self.region == "tw":
+                sector_block = f"""## TWSE Sector Performance (listed-market industry indices)
+Leading sectors: {top_sectors_text if top_sectors_text else "N/A"}
+Lagging sectors: {bottom_sectors_text if bottom_sectors_text else "N/A"}
+Turnover share of these sectors: {self._format_tw_turnover_share(overview) or "N/A"}"""
+            elif self.profile.has_sector_rankings:
                 sector_block = f"""## Sector / Theme Performance
 Industry leading: {top_sectors_text if top_sectors_text else "N/A"}
 Industry lagging: {bottom_sectors_text if bottom_sectors_text else "N/A"}
@@ -1768,6 +1804,13 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 )
             if not self.profile.has_sector_rankings:
                 data_limit_lines.append("- Sector/theme ranking data is not available for this market.")
+            elif self.region == "tw":
+                data_limit_lines.append(
+                    "- Sector data covers TWSE-listed industry indices only (no TPEx sectors, no concept themes, "
+                    "no per-sector net inflow); turnover share is not a net flow."
+                    if (overview.top_sectors or overview.bottom_sectors)
+                    else "- TWSE sector ranking data could not be fetched for this run."
+                )
             if data_limit_lines:
                 data_limits_block = "## Data Limits\n" + "\n".join(data_limit_lines)
         else:
@@ -1777,7 +1820,12 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元"""
 
-            if self.profile.has_sector_rankings:
+            if self.profile.has_sector_rankings and self.region == "tw":
+                sector_block = f"""## 上市类股表现（证交所类股指数）
+类股领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
+类股领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
+上述类股成交比重: {self._format_tw_turnover_share(overview) or "暂无数据"}"""
+            elif self.profile.has_sector_rankings:
                 sector_block = f"""## 板块表现
 行业领涨: {top_sectors_text if top_sectors_text else "暂无数据"}
 行业领跌: {bottom_sectors_text if bottom_sectors_text else "暂无数据"}
@@ -1789,6 +1837,12 @@ Concept lagging: {bottom_concepts_text if bottom_concepts_text else "N/A"}"""
                 data_limit_lines.append("- 该市场暂无涨跌家数、涨跌停、成交额汇总、参与度或资金流信号。")
             if not self.profile.has_sector_rankings:
                 data_limit_lines.append("- 该市场暂无行业板块/概念题材涨跌榜。")
+            elif self.region == "tw":
+                data_limit_lines.append(
+                    "- 类股数据仅涵盖证交所上市类股指数（不含上柜类股、概念题材与类股净流入）；成交比重不是净流入。"
+                    if (overview.top_sectors or overview.bottom_sectors)
+                    else "- 本次未能取得证交所类股涨跌排行。"
+                )
             if data_limit_lines:
                 data_limits_block = "## 数据边界\n" + "\n".join(data_limit_lines)
 
@@ -2009,6 +2063,12 @@ Output the report content directly, no extra commentary.
 - **Industry Laggards**: {bottom_text or "N/A"}
 - **Concept Leaders**: {top_concept_text or "N/A"}
 - **Concept Laggards**: {bottom_concept_text or "N/A"}
+"""
+                if self.region == "tw":
+                    sector_section = f"""
+### 4. TWSE Sector Highlights
+- **Leading Sectors**: {top_text or "N/A"}
+- **Lagging Sectors**: {bottom_text or "N/A"}
 """
             market_names = {
                 "us": "US Market Recap",

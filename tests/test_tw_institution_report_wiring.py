@@ -59,6 +59,21 @@ _EMPTY_BUNDLE = {
 
 
 class TestTwInstitutionReportWiring(unittest.TestCase):
+    def setUp(self):
+        # Keep every test in this file offline: the tw path now also reads the 類股
+        # table and may start the multi-day 三大法人 history walker.
+        self._sector_patch = patch(
+            "data_provider.tw_sector_fetcher.TwSectorFetcher.get_sector_table", return_value=[]
+        )
+        self._history_patch = patch(
+            "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher._walk_history",
+            side_effect=lambda anchor, state: state["done"].set(),
+        )
+        self.sector_mock = self._sector_patch.start()
+        self._history_patch.start()
+        self.addCleanup(self._sector_patch.stop)
+        self.addCleanup(self._history_patch.stop)
+
     def _context(self, code, institutional_return=None, institutional_side_effect=None):
         """Run get_fundamental_context(code) offline; returns (ctx, tw_fetcher_mock)."""
         manager = DataFetcherManager(fetchers=[])
@@ -89,9 +104,21 @@ class TestTwInstitutionReportWiring(unittest.TestCase):
         self.assertEqual(data["total_net"], 3576)
         self.assertEqual(data["unit"], "shares")
         self.assertEqual(data["source"], "TWSE-T86")
-        # other offshore blocks untouched
-        for block in ("capital_flow", "dragon_tiger", "boards"):
+        # dragon_tiger has no Taiwan equivalent; boards stays not_supported when the
+        # 類股 table is unavailable (stubbed empty in setUp).
+        for block in ("dragon_tiger", "boards"):
             self.assertEqual(ctx["coverage"].get(block), "not_supported")
+        # capital_flow is derived from the same 三大法人 record: latest day only here,
+        # because no earlier trading days were loaded -> 5d / 10d stay None (never a
+        # partial sum).
+        self.assertEqual(ctx["coverage"].get("capital_flow"), "ok")
+        stock_flow = ctx["capital_flow"]["data"]["stock_flow"]
+        self.assertEqual(stock_flow["main_net_inflow"], 3576)
+        self.assertIsNone(stock_flow["inflow_5d"])
+        self.assertIsNone(stock_flow["inflow_10d"])
+        self.assertEqual(stock_flow["unit"], "shares")
+        self.assertEqual(stock_flow["basis"], "tw_institutional_net")
+        self.assertEqual(ctx["capital_flow"]["data"]["sector_rankings"], {"top": [], "bottom": []})
         # institution data must surface: the top-level status (which consumers key off)
         # is not 'not_supported' even though valuation/growth/earnings are unavailable.
         self.assertNotEqual(ctx["status"], "not_supported")
@@ -255,6 +282,77 @@ class TestTwInstitutionReportWiring(unittest.TestCase):
             ctx = manager.get_fundamental_context("2330.TW")
         self.assertEqual(ctx["coverage"].get("institution"), "not_supported")
         self.assertEqual(tw_mock.call_count, 0)  # institution fetch skipped when disabled
+
+    # ---- tw 類股排行 -> boards; 三大法人多日累計 -> capital_flow ----------------------
+    def test_tw_boards_and_multi_day_flow_populated(self):
+        table = [
+            {"name": "金融保險", "change_pct": 2.16, "amount_share_pct": 15.0},
+            {"name": "半導體", "change_pct": 1.23, "amount_share_pct": 60.0},
+            {"name": "航運", "change_pct": -1.48},
+        ]
+        self.sector_mock.return_value = table
+        flow = {"date": "20260629", "unit": "shares", "source": "TWSE-T86",
+                "net_1d": 3576, "net_5d": -120000, "net_10d": 450000, "days_available": 10}
+        with patch(
+            "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_institutional_flow",
+            return_value=flow,
+        ):
+            ctx, _ = self._context("2330.TW", institutional_return=dict(_FAKE_REC))
+        self.assertEqual(ctx["coverage"].get("boards"), "ok")
+        boards = ctx["boards"]["data"]
+        self.assertEqual([item["name"] for item in boards["top"]], ["金融保險", "半導體", "航運"])
+        self.assertEqual(boards["bottom"][0]["name"], "航運")
+        self.assertEqual([item["name"] for item in boards["turnover_top"]], ["半導體", "金融保險"])
+        self.assertEqual(ctx["coverage"].get("capital_flow"), "ok")
+        stock_flow = ctx["capital_flow"]["data"]["stock_flow"]
+        self.assertEqual(
+            (stock_flow["main_net_inflow"], stock_flow["inflow_5d"], stock_flow["inflow_10d"]),
+            (3576, -120000, 450000),
+        )
+        self.assertEqual(ctx["coverage"].get("dragon_tiger"), "not_supported")
+        self.assertEqual(ctx["status"], "ok")
+
+    def test_tw_capital_flow_stays_not_supported_without_institution_record(self):
+        ctx, _ = self._context("2330.TW", institutional_return=None)
+        self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported")
+        self.assertEqual(ctx["capital_flow"]["data"], {})
+
+    def test_tw_flow_summary_failure_falls_back_to_latest_day(self):
+        with patch(
+            "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_institutional_flow",
+            side_effect=RuntimeError("boom"),
+        ):
+            ctx, _ = self._context("2330.TW", institutional_return=dict(_FAKE_REC))
+        stock_flow = ctx["capital_flow"]["data"]["stock_flow"]
+        self.assertEqual(stock_flow["main_net_inflow"], 3576)
+        self.assertIsNone(stock_flow["inflow_5d"])
+
+    def test_non_tw_markets_never_touch_the_tw_sector_or_flow_sources(self):
+        with patch(
+            "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_institutional_flow"
+        ) as flow_mock:
+            for code in ("AAPL", "hk00700", "7203.T", "005930.KS"):
+                ctx, _ = self._context(code, institutional_return=dict(_FAKE_REC))
+                self.assertEqual(ctx["coverage"].get("capital_flow"), "not_supported", code)
+                self.assertEqual(ctx["coverage"].get("boards"), "not_supported", code)
+        self.assertEqual(flow_mock.call_count, 0)
+        self.assertEqual(self.sector_mock.call_count, 0)
+
+    def test_agent_capital_flow_tool_path_supports_tw(self):
+        manager = DataFetcherManager(fetchers=[])
+        flow = {"net_1d": 3576, "net_5d": 10, "net_10d": -20, "days_available": 10}
+        with patch("src.config.get_config", return_value=_OFFSHORE_CFG), \
+                patch(_TW_FETCHER_METHOD, return_value=dict(_FAKE_REC)), \
+                patch(
+                    "data_provider.tw_institutional_fetcher.TwInstitutionalFetcher.get_institutional_flow",
+                    return_value=flow,
+                ):
+            block = manager.get_capital_flow_context("2330.TW")
+            us_block = manager.get_capital_flow_context("AAPL")
+        self.assertEqual(block["status"], "ok")
+        self.assertEqual(block["data"]["stock_flow"]["inflow_10d"], -20)
+        self.assertEqual(block["data"]["stock_flow"]["basis"], "tw_institutional_net")
+        self.assertEqual(us_block["status"], "not_supported")
 
 
 if __name__ == "__main__":
