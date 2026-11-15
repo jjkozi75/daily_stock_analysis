@@ -147,6 +147,66 @@ class TestTwInstitutionPrompt(unittest.TestCase):
         p = self._prompt({"institution": {"status": "not_supported", "data": {}}})
         self.assertNotIn("三大法人动向", p)
 
+    # ---- 台股资金流向（三大法人 1/5/10 日）+ 类股排行 -----------------------------------
+    _TW_FLOW = {
+        "status": "ok",
+        "data": {
+            "stock_flow": {
+                "main_net_inflow": 3576, "inflow_5d": -120000, "inflow_10d": None,
+                "unit": "shares", "basis": "tw_institutional_net", "date": "20260629",
+                "days_available": 7,
+            },
+            "sector_rankings": {"top": [], "bottom": []},
+        },
+    }
+    _TW_BOARDS = {
+        "status": "ok",
+        "data": {
+            "top": [{"name": "金融保險", "change_pct": 2.16}],
+            "bottom": [{"name": "航運", "change_pct": -1.48}],
+            "turnover_top": [{"name": "半導體", "amount_share_pct": 60.0}],
+        },
+    }
+
+    def test_tw_capital_flow_uses_taiwan_table_not_a_share_wording(self):
+        p = self._prompt({"capital_flow": self._TW_FLOW, "boards": self._TW_BOARDS})
+        self.assertIn("台股资金流向", p)
+        self.assertIn("单位:股", p)
+        self.assertIn("| 近1日净买卖超 | 3576 |", p)
+        self.assertIn("| 近5日累计 | -120000 |", p)
+        self.assertIn("| 近10日累计 | N/A |", p)        # incomplete window is never estimated
+        self.assertIn("金融保險(+2.16%)", p)
+        self.assertIn("航運(-1.48%)", p)
+        self.assertIn("半導體(60.00%)", p)
+        self.assertNotIn("主力资金流向", p)             # the A-share table is not reused
+        self.assertNotIn("主力净流入", p)
+
+    def test_a_share_capital_flow_table_is_unchanged(self):
+        flow = {"status": "ok", "data": {"stock_flow": {"main_net_inflow": 1.5e8, "inflow_5d": None,
+                                                        "inflow_10d": None},
+                                         "sector_rankings": {"top": [], "bottom": []}}}
+        p = self._prompt({"capital_flow": flow})
+        self.assertIn("主力资金流向", p)
+        self.assertNotIn("台股资金流向", p)
+
+    def test_tw_flow_feeds_the_decision_guard_bias(self):
+        from src.analyzer import _capital_flow_bias_with_status
+
+        def bias(one, five, ten):
+            flow = {"status": "ok", "data": {"stock_flow": {
+                "main_net_inflow": one, "inflow_5d": five, "inflow_10d": ten,
+                "unit": "shares", "basis": "tw_institutional_net"}}}
+            return _capital_flow_bias_with_status({"capital_flow": flow})
+
+        self.assertEqual(bias(100, 500, 900), ("inflow", "ok"))
+        self.assertEqual(bias(-100, None, None), ("outflow", "ok"))
+        self.assertEqual(bias(100, -500, None)[0], "neutral")      # windows disagree
+        # Before this change a Taiwan stock always landed here and lost its buy call.
+        self.assertEqual(
+            _capital_flow_bias_with_status({"capital_flow": {"status": "not_supported", "data": {}}})[0],
+            "unavailable",
+        )
+
     def test_institution_absent_when_any_core_net_missing(self):
         # prompt gate matches the render / base.py gate: ALL four core nets required,
         # so a partial record never reaches the LLM as an unqualified chip signal.

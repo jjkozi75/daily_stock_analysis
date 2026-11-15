@@ -73,7 +73,8 @@ def test_tw_prompt_uses_taiwan_context_and_discloses_partial_coverage(language):
 
     assert analyzer.profile.region == analyzer.strategy.region == "tw"
     assert not analyzer.profile.has_market_stats
-    assert not analyzer.profile.has_sector_rankings
+    assert analyzer.profile.has_sector_rankings  # TWSE 類股漲跌排行 (fail-open)
+    assert "概念领" not in prompt and "概念板块" not in prompt and "Concept" not in prompt
     assert "TWOII:" in prompt
     assert "TWII:" not in prompt
     assert "台股" in prompt if language == "zh" else "Taiwan market" in prompt
@@ -256,3 +257,56 @@ def test_tw_markdown_only_share_image_recognizes_market_heading(heading):
     assert ("台股市场复盘" if heading == "台股大盘复盘" else heading) in html
     assert 'class="poster market' in html
     assert "TWOII: data unavailable" in html
+
+
+_TW_SECTORS_TOP = [
+    {"name": "半導體", "change_pct": 1.23, "amount_share_pct": 41.5},
+    {"name": "金融保險", "change_pct": 2.16, "amount_share_pct": 6.2},
+]
+_TW_SECTORS_BOTTOM = [{"name": "水泥", "change_pct": -0.14}]
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_tw_prompt_includes_twse_sector_rankings_without_concepts(language):
+    with patch("src.market_analyzer.DataFetcherManager"):
+        analyzer = MarketAnalyzer(region="tw", config=Config(report_language=language))
+    overview = MarketOverview(
+        date="2026-11-13", indices=[_index()],
+        top_sectors=list(_TW_SECTORS_TOP), bottom_sectors=list(_TW_SECTORS_BOTTOM),
+    )
+    prompt = analyzer._build_review_prompt(overview, [])
+
+    assert "半導體(+1.23%)" in prompt
+    assert "水泥(-0.14%)" in prompt
+    assert "半導體 41.50%" in prompt  # 成交比重 only for items that carry it
+    assert "概念领" not in prompt and "概念板块" not in prompt and "Concept" not in prompt
+    assert ("不是净流入" in prompt) if language == "zh" else ("not a net flow" in prompt)
+
+
+def test_tw_overview_uses_tw_sector_fetcher_and_skips_concepts():
+    with patch("src.market_analyzer.DataFetcherManager") as manager_cls:
+        analyzer = MarketAnalyzer(region="tw", config=Config(report_language="zh"))
+    fetcher = MagicMock()
+    fetcher.get_sector_rankings.return_value = (list(_TW_SECTORS_TOP), list(_TW_SECTORS_BOTTOM))
+    overview = MarketOverview(date="2026-11-13")
+    with patch("data_provider.tw_sector_fetcher.get_tw_sector_fetcher", return_value=fetcher):
+        analyzer._get_sector_rankings(overview)
+
+    assert [item["name"] for item in overview.top_sectors] == ["半導體", "金融保險"]
+    assert [item["name"] for item in overview.bottom_sectors] == ["水泥"]
+    # The A-share sector / concept sources are never consulted for Taiwan.
+    manager_cls.return_value.get_sector_rankings.assert_not_called()
+
+
+def test_tw_sector_fetch_failure_is_disclosed_not_fatal():
+    with patch("src.market_analyzer.DataFetcherManager"):
+        analyzer = MarketAnalyzer(region="tw", config=Config(report_language="zh"))
+    fetcher = MagicMock()
+    fetcher.get_sector_rankings.return_value = None
+    overview = MarketOverview(date="2026-11-13", indices=[_index()])
+    with patch("data_provider.tw_sector_fetcher.get_tw_sector_fetcher", return_value=fetcher):
+        analyzer._get_sector_rankings(overview)
+    prompt = analyzer._build_review_prompt(overview, [])
+
+    assert overview.top_sectors == [] and overview.bottom_sectors == []
+    assert "本次未能取得证交所类股涨跌排行" in prompt

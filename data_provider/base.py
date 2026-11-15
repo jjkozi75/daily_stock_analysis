@@ -4217,6 +4217,19 @@ class DataFetcherManager:
 
         result_ctx["belong_boards"] = belong_boards or futu_boards
 
+        # tw-only, additive, fail-open: 類股漲跌排行 (boards) + 三大法人 1/5/10 日買賣超
+        # as the Taiwan equivalent of capital_flow. Any failure leaves the blocks at
+        # not_supported exactly as before.
+        if market == "tw":
+            self._apply_tw_boards_and_capital_flow(
+                result_ctx,
+                stock_code,
+                tw_record,
+                stage_timeout=stage_timeout,
+                fetch_timeout=fetch_timeout,
+                start_ts=start_ts,
+            )
+
         capital_flow_status = result_ctx["capital_flow"].get("status", "not_supported")
         boards_status = result_ctx["boards"].get("status", "not_supported")
         block_statuses = {
@@ -4268,6 +4281,145 @@ class DataFetcherManager:
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
+
+    def _apply_tw_boards_and_capital_flow(
+        self,
+        result_ctx: Dict[str, Any],
+        stock_code: str,
+        tw_record: Optional[Dict[str, Any]],
+        *,
+        stage_timeout: float,
+        fetch_timeout: float,
+        start_ts: float,
+    ) -> None:
+        """Fill ``boards`` and ``capital_flow`` for a Taiwan stock (in place, fail-open).
+
+        boards       <- TWSE 類股指數漲跌排行 (+ 成交比重 when available).
+        capital_flow <- 三大法人合計買賣超 for 1 / 5 / 10 trading days, in SHARES.
+
+        Taiwan publishes no A-share-style "main capital net inflow"; 三大法人買賣超
+        is the market's conventional flow measure, so it is mapped onto the existing
+        ``stock_flow`` keys and tagged with ``basis`` / ``unit`` so consumers can
+        label it correctly. ``sector_rankings`` (net inflow by sector) stays empty:
+        no such figure is published for Taiwan.
+        """
+        if fetch_timeout <= 0:  # FUNDAMENTAL_FETCH_TIMEOUT_SECONDS=0 disables fetches
+            return
+
+        def _remaining() -> float:
+            return max(stage_timeout - (time.time() - start_ts), 0.0)
+
+        # ---- boards: cheap (cached whole-table), so it goes first -------------------
+        budget = _remaining()
+        if budget > 0:
+            def _boards_task() -> Optional[Dict[str, Any]]:
+                from data_provider.tw_sector_fetcher import get_tw_sector_fetcher
+
+                sector_fetcher = get_tw_sector_fetcher()
+                rankings = sector_fetcher.get_sector_rankings(5)
+                if not rankings:
+                    return None
+                return {
+                    "top": rankings[0],
+                    "bottom": rankings[1],
+                    "turnover_top": sector_fetcher.get_turnover_rankings(5),
+                }
+
+            boards_payload, boards_err, boards_ms = self._run_with_retry(
+                _boards_task, budget, "fundamental_tw_boards"
+            )
+            if boards_err:
+                logger.warning("[tw-sector] fetch failed/timeout code=%s: %s", stock_code, boards_err)
+            if isinstance(boards_payload, dict) and (boards_payload.get("top") or boards_payload.get("bottom")):
+                boards_payload["scope"] = "TWSE 上市類股"
+                result_ctx["boards"] = self._build_fundamental_block(
+                    "ok",
+                    boards_payload,
+                    [{"provider": "TwSectorFetcher", "result": "ok", "duration_ms": boards_ms}],
+                    [],
+                )
+
+        # ---- capital_flow: derived from the 三大法人 record already fetched ----------
+        flow_block = self._build_tw_capital_flow_block(stock_code, tw_record, _remaining())
+        if flow_block is not None:
+            result_ctx["capital_flow"] = flow_block
+
+    def _build_tw_capital_flow_block(
+        self,
+        stock_code: str,
+        tw_record: Optional[Dict[str, Any]],
+        budget_seconds: float,
+    ) -> Optional[Dict[str, Any]]:
+        """capital_flow block from a 三大法人 record, or ``None`` when there is no record."""
+        if not isinstance(tw_record, dict) or tw_record.get("total_net") is None:
+            return None
+        flow: Optional[Dict[str, Any]] = None
+        fetcher = getattr(self, "_tw_institutional_fetcher", None)
+        summarize = getattr(fetcher, "get_institutional_flow", None)
+        budget = max(float(budget_seconds or 0.0), 0.0)
+        if callable(summarize) and budget > 0:
+            wait_seconds = max(budget - 0.3, 0.0)
+            flow, flow_err, _flow_ms = self._run_with_retry(
+                lambda: summarize(stock_code, tw_record, wait_seconds=wait_seconds),
+                budget,
+                "fundamental_tw_capital_flow",
+            )
+            if flow_err:
+                logger.warning("[tw-inst] flow summary failed/timeout code=%s: %s", stock_code, flow_err)
+        if not isinstance(flow, dict) or flow.get("net_1d") is None:
+            # No multi-day history (timeout / 上櫃 / walker not ready): keep the
+            # latest day only rather than dropping the block.
+            flow = {"net_1d": tw_record.get("total_net"), "net_5d": None, "net_10d": None, "days_available": 1}
+        return self._build_fundamental_block(
+            "ok",
+            {
+                "stock_flow": {
+                    "main_net_inflow": flow.get("net_1d"),
+                    "inflow_5d": flow.get("net_5d"),
+                    "inflow_10d": flow.get("net_10d"),
+                    "unit": tw_record.get("unit") or "shares",
+                    "basis": "tw_institutional_net",
+                    "date": tw_record.get("date"),
+                    "days_available": flow.get("days_available"),
+                },
+                "sector_rankings": {"top": [], "bottom": []},
+            },
+            [{"provider": tw_record.get("source", "tw-institutional"), "result": "ok", "duration_ms": 0}],
+            [],
+        )
+
+    def _get_tw_capital_flow_context(self, stock_code: str, timeout: float) -> Dict[str, Any]:
+        """Standalone 台股 capital_flow block (agent ``get_capital_flow`` tool path)."""
+        not_supported = self._build_fundamental_block(
+            "not_supported",
+            {},
+            [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+            ["not supported"],
+        )
+        if timeout <= 0:
+            return not_supported
+        fetcher = getattr(self, "_tw_institutional_fetcher", None)
+        if fetcher is None:
+            try:
+                from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+
+                fetcher = TwInstitutionalFetcher()
+                self._tw_institutional_fetcher = fetcher
+            except Exception as exc:  # noqa: BLE001 - wiring failure: loud but fail-open
+                logger.error("[tw-inst] fetcher init failed (wiring bug?) code=%s: %s", stock_code, exc)
+                return not_supported
+        started = time.time()
+        tw_record, err, _ms = self._run_with_retry(
+            lambda: fetcher.get_institutional_net(stock_code),
+            timeout,
+            "tw_capital_flow_record",
+        )
+        if err:
+            logger.warning("[tw-inst] fetch failed/timeout code=%s: %s", stock_code, err)
+        block = self._build_tw_capital_flow_block(
+            stock_code, tw_record, max(timeout - (time.time() - started), 0.0)
+        )
+        return block if block is not None else not_supported
 
     def build_failed_fundamental_context(self, stock_code: str, reason: str) -> Dict[str, Any]:
         """Build a consistent failed-context payload for caller-side fallback."""
@@ -4679,6 +4831,9 @@ class DataFetcherManager:
         config = get_config()
         stock_code = normalize_stock_code(stock_code)
         timeout = float(budget_seconds if budget_seconds is not None else config.fundamental_fetch_timeout_seconds)
+        # 台股：以三大法人 1/5/10 日净买卖超作为资金流向（单位:股），fail-open。
+        if _is_tw_market(stock_code):
+            return self._get_tw_capital_flow_context(stock_code, timeout)
         # 与预算探测/补充循环同口径(_market_tag 不识别 .US/.N/.O 后缀)
         if _is_non_cn_request(stock_code) or _is_etf_code(stock_code):
             return self._build_fundamental_block(

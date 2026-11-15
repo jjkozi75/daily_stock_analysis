@@ -28,7 +28,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -53,6 +54,18 @@ _T86_TRUST = "投信買賣超股數"
 _T86_DEALER = "自營商買賣超股數"
 _T86_TOTAL = "三大法人買賣超股數"
 _T86_CORE = (_T86_CODE, _T86_FOREIGN, _T86_TRUST, _T86_DEALER, _T86_TOTAL)
+
+# TWSE "no rows for this date" body (weekend / holiday / not yet published). Only this
+# exact family of messages may be read as "not a trading day" by the multi-day flow
+# walk; any other non-OK body aborts the walk so a day is never silently skipped.
+_T86_NO_DATA_MARKERS = ("沒有符合條件", "查詢無資料", "No data")
+# Multi-day 資金流向 windows (trading days, newest day included).
+_FLOW_WINDOWS = (5, 10)
+# Calendar days the history walk may look back to collect max(_FLOW_WINDOWS) - 1
+# earlier trading days (covers a Lunar-New-Year-sized closure).
+_FLOW_MAX_LOOKBACK_DAYS = 30
+# A dated (historical) T86 table never changes once published.
+_DATED_CACHE_TTL_SECONDS = 86400
 
 # TPEx OpenAPI column keys (verified live 2026-06; note the inconsistent spacing in
 # the official feed). foreign = dealer-excluded, matching TotalDifference =
@@ -129,6 +142,10 @@ class TwInstitutionalFetcher:
         # open, instead of paying timeout + throttle on every stock during an outage.
         # Reuses the repo's CircuitBreaker (same one DataFetcherManager uses).
         self._breaker = CircuitBreaker(failure_threshold=3, cooldown_seconds=300.0)
+        # Multi-day flow history, keyed by the anchor (latest) trading date. Filled by
+        # one background walker per anchor so per-stock calls never pay the ~9 extra
+        # throttled whole-market downloads themselves.
+        self._history: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------ public
     def get_institutional_net(
@@ -167,6 +184,146 @@ class TwInstitutionalFetcher:
                 )
                 return None
         return record
+
+    # ------------------------------------------------------- multi-day 資金流向
+    def get_institutional_flow(
+        self,
+        stock_code: str,
+        record: Optional[dict] = None,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> Optional[dict]:
+        """三大法人 net buy/sell summed over 1 / 5 / 10 trading days, or ``None``.
+
+        Returns ``{"date", "unit": "shares", "source", "net_1d", "net_5d", "net_10d",
+        "days_available"}``. ``net_1d`` is the latest day's 三大法人合計 (always set).
+        ``net_5d`` / ``net_10d`` are set ONLY when every trading day of that window
+        was loaded -- a partial window is reported as ``None``, never as a smaller sum.
+
+        The earlier days come from dated T86 whole-market tables loaded by a
+        background walker (one per latest trading date, shared by all stocks).
+        ``wait_seconds`` bounds how long this call waits for that walker; with 0 it
+        returns whatever is ready. 上櫃 (.TWO) has no dated feed here, so it only
+        ever returns ``net_1d``. Fail-open: any error returns ``None``.
+        """
+        try:
+            market = self._market_of(stock_code)
+            if market is None:
+                return None
+            if record is None:
+                record = self.get_institutional_net(stock_code)
+            if not isinstance(record, dict) or record.get("total_net") is None:
+                return None
+            anchor = self._norm_ad_date(record.get("date"))
+            flow: Dict[str, Any] = {
+                "date": anchor,
+                "unit": record.get("unit") or "shares",
+                "source": record.get("source"),
+                "net_1d": int(record["total_net"]),
+                "net_5d": None,
+                "net_10d": None,
+                "days_available": 1,
+            }
+            if market != "twse" or anchor is None:
+                return flow
+            state = self._ensure_history(anchor)
+            if wait_seconds and wait_seconds > 0:
+                state["done"].wait(wait_seconds)
+            with self._lock:
+                tables: List[Dict[str, dict]] = list(state["tables"])
+            base = self._base_code(stock_code)
+            # A stock missing from a trading day's T86 table had no institutional
+            # trades that day (the table only lists active names) -> genuine 0.
+            earlier = [int((table.get(base) or {}).get("total_net") or 0) for table in tables]
+            flow["days_available"] = 1 + len(earlier)
+            for window in _FLOW_WINDOWS:
+                need = window - 1
+                if len(earlier) >= need:
+                    flow[f"net_{window}d"] = flow["net_1d"] + sum(earlier[:need])
+            return flow
+        except Exception as exc:  # noqa: BLE001 - fail-open by contract
+            logger.info("[tw-inst] flow summary failed code=%s: %s", stock_code, exc)
+            return None
+
+    def _ensure_history(self, anchor: str) -> Dict[str, Any]:
+        """Start (once per anchor date) the background walk over earlier trading days."""
+        with self._lock:
+            state = self._history.get(anchor)
+            if state is not None:
+                return state
+            state = {"tables": [], "done": threading.Event()}
+            self._history[anchor] = state
+        thread = threading.Thread(
+            target=self._walk_history,
+            args=(anchor, state),
+            name=f"tw-inst-history-{anchor}",
+            daemon=True,
+        )
+        thread.start()
+        return state
+
+    def _walk_history(self, anchor: str, state: Dict[str, Any]) -> None:
+        """Load the trading days before ``anchor``, newest first, into ``state``.
+
+        Stops at the first day whose status is unknown (network error, circuit open,
+        unexpected body) so the collected list is always a CONTIGUOUS run of trading
+        days -- a gap would make a 5-/10-day sum silently wrong.
+        """
+        try:
+            needed = max(_FLOW_WINDOWS) - 1
+            day = datetime.strptime(anchor, "%Y%m%d")
+            for _ in range(_FLOW_MAX_LOOKBACK_DAYS):
+                if len(state["tables"]) >= needed:
+                    break
+                day -= timedelta(days=1)
+                if day.weekday() >= 5:  # TWSE make-up Saturdays are rare; skipped
+                    continue
+                status, table = self._load_dated_twse(day.strftime("%Y%m%d"))
+                if status == "no_data":
+                    continue
+                if status != "ok":
+                    break
+                with self._lock:
+                    state["tables"].append(table)
+        except Exception as exc:  # noqa: BLE001 - background walker must never raise
+            logger.info("[tw-inst] history walk stopped anchor=%s: %s", anchor, exc)
+        finally:
+            state["done"].set()
+
+    def _load_dated_twse(self, ad_date: str) -> Tuple[str, Dict[str, dict]]:
+        """One dated T86 table -> ``("ok", table)`` / ``("no_data", {})`` / ``("unknown", {})``."""
+        key = ("twse", ad_date)
+        cached = self._read_cache(key)
+        if cached is not None:
+            return "ok", cached
+        if not self._breaker.is_available("twse"):
+            return "unknown", {}
+        try:
+            payload = self._get_json(
+                _T86_URL, {"response": "json", "selectType": "ALLBUT0999", "date": ad_date}
+            )
+        except Exception as exc:  # noqa: BLE001 - network / HTTP / WAF page
+            self._breaker.record_failure("twse", str(exc))
+            logger.info("[tw-inst] dated T86 %s failed: %s", ad_date, exc)
+            return "unknown", {}
+        self._breaker.record_success("twse")
+        if not isinstance(payload, dict):
+            return "unknown", {}
+        if payload.get("stat") != "OK":
+            stat = str(payload.get("stat") or "")
+            if not payload.get("data") and any(marker in stat for marker in _T86_NO_DATA_MARKERS):
+                return "no_data", {}
+            return "unknown", {}
+        served = self._norm_ad_date(payload.get("date"))
+        if served != ad_date:  # endpoint answered with a different day -> do not trust
+            return "unknown", {}
+        table = self._parse_t86_payload(payload, ad_date)
+        if not table:
+            return "unknown", {}
+        with self._lock:
+            self._cache[key] = table
+            self._cache_at[key] = time.time()
+        return "ok", table
 
     # ------------------------------------------------------------------ routing
     @staticmethod
@@ -241,7 +398,9 @@ class TwInstitutionalFetcher:
     def _read_cache(self, key: Any) -> Optional[Dict[str, dict]]:
         with self._lock:
             cached = self._cache.get(key)
-            if cached is not None and (time.time() - self._cache_at.get(key, 0.0)) < self._cache_ttl:
+            dated = isinstance(key, tuple) and len(key) > 1 and key[1] is not None
+            ttl = max(self._cache_ttl, _DATED_CACHE_TTL_SECONDS) if dated else self._cache_ttl
+            if cached is not None and (time.time() - self._cache_at.get(key, 0.0)) < ttl:
                 return cached
         return None
 
@@ -277,6 +436,9 @@ class TwInstitutionalFetcher:
         if ad_date:
             params["date"] = ad_date
         payload = self._get_json(_T86_URL, params)
+        return self._parse_t86_payload(payload, ad_date)
+
+    def _parse_t86_payload(self, payload: Any, ad_date: Optional[str]) -> Dict[str, dict]:
         if not isinstance(payload, dict) or payload.get("stat") != "OK":
             return {}
         rows = payload.get("data")

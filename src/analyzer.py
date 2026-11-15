@@ -4622,7 +4622,73 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             isinstance(sector_flow, dict)
             and (sector_flow.get("top") or sector_flow.get("bottom"))
         )
-        if has_capital_flow:
+        # 台股：capital_flow 来自三大法人 1/5/10 日净买卖超（单位:股），不是 A 股口径的
+        # 主力资金净流入(金额)。单独成表并标明口径，避免模型把股数当成金额解读。
+        tw_flow_basis = (
+            isinstance(stock_flow, dict)
+            and stock_flow.get("basis") == "tw_institutional_net"
+        )
+        if has_capital_flow and tw_flow_basis:
+            boards_block = (
+                fundamental_context.get("boards", {})
+                if isinstance(fundamental_context, dict)
+                else {}
+            )
+            boards_data = boards_block.get("data", {}) if isinstance(boards_block, dict) else {}
+            if not isinstance(boards_data, dict):
+                boards_data = {}
+
+            def _tw_sector_text(items: Any, value_key: str, suffix: str) -> str:
+                parts = []
+                for item in (items or [])[:3]:
+                    if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+                        continue
+                    value = item.get(value_key)
+                    if isinstance(value, (int, float)):
+                        number = f"{value:+.2f}" if value_key == "change_pct" else f"{value:.2f}"
+                        parts.append(f"{str(item['name']).strip()}({number}{suffix})")
+                    else:
+                        parts.append(str(item["name"]).strip())
+                return (", " if english else "、").join(parts) or "N/A"
+
+            def _tw_flow_value(key: str) -> Any:
+                value = stock_flow.get(key)
+                return "N/A" if value is None else value
+
+            tw_top = _tw_sector_text(boards_data.get("top"), "change_pct", "%")
+            tw_bottom = _tw_sector_text(boards_data.get("bottom"), "change_pct", "%")
+            tw_turnover = _tw_sector_text(boards_data.get("turnover_top"), "amount_share_pct", "%")
+            if english:
+                prompt += f"""
+### Taiwan Capital Flow (three institutions' cumulative net buy/sell, unit: shares — not a currency amount)
+| Indicator | Value | Decision Meaning |
+|------|------|----------|
+| 1-Day Net | {_tw_flow_value('main_net_inflow')} | Positive = net buying, leans supportive; negative = net selling, leans suppressive |
+| 5-Day Cumulative Net | {_tw_flow_value('inflow_5d')} | Used to judge flow persistence |
+| 10-Day Cumulative Net | {_tw_flow_value('inflow_10d')} | Used to judge flow persistence |
+| Leading TWSE Sectors (change) | {tw_top} | Sector strength reference |
+| Lagging TWSE Sectors (change) | {tw_bottom} | Sector risk reference |
+| Top Sectors by Turnover Share | {tw_turnover} | Where trading is concentrated; this is NOT a net inflow |
+| Data Date | {_tw_flow_value('date')} | TWSE open data |
+
+> N/A means the window is not fully loaded: write "data unavailable" for it and never estimate it. Taiwan publishes no A-share-style main-capital or per-sector net inflow; do not invent one. Use the figures only as a filter on price position.
+"""
+            else:
+                prompt += f"""
+### 台股资金流向（三大法人合计净买卖超累计，单位:股，非金额）
+| 指标 | 数值 | 决策含义 |
+|------|------|----------|
+| 近1日净买卖超 | {_tw_flow_value('main_net_inflow')} | 正值=净买超偏支持，负值=净卖超偏压制 |
+| 近5日累计 | {_tw_flow_value('inflow_5d')} | 用于判断资金持续性 |
+| 近10日累计 | {_tw_flow_value('inflow_10d')} | 用于判断资金持续性 |
+| 上市类股领涨（涨跌幅） | {tw_top} | 类股强弱参考 |
+| 上市类股领跌（涨跌幅） | {tw_bottom} | 类股风险参考 |
+| 成交比重靠前类股 | {tw_turnover} | 资金集中方向；这不是净流入 |
+| 资料日期 | {_tw_flow_value('date')} | 证交所开放资料 |
+
+> N/A 表示该区间资料尚未完整载入，请写“数据缺失”，禁止估算。台股没有 A 股口径的主力资金或类股净流入数据，禁止编造。以上数据只能作为价格位置的过滤器。
+"""
+        elif has_capital_flow:
             top_sectors = sector_flow.get("top", []) if isinstance(sector_flow, dict) else []
             bottom_sectors = sector_flow.get("bottom", []) if isinstance(sector_flow, dict) else []
             sector_separator = ", " if english else "、"

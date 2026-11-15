@@ -709,7 +709,7 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
     sector_rankings = data.get("sector_rankings") or {}
     errors = ctx.get("errors") or []
 
-    return {
+    result = {
         "stock_code": stock_code,
         "status": status,
         "main_net_inflow": stock_flow.get("main_net_inflow"),
@@ -721,6 +721,17 @@ def _handle_get_capital_flow(stock_code: str) -> dict:
         },
         "errors": errors,
     }
+    if stock_flow.get("basis") == "tw_institutional_net":
+        # Taiwan: values are 三大法人 cumulative net buy/sell in SHARES, not a
+        # currency-valued main-capital inflow. Say so, so the model labels it right.
+        result["unit"] = stock_flow.get("unit") or "shares"
+        result["basis"] = "Taiwan three institutional investors net buy/sell (1/5/10 trading days)"
+        result["data_date"] = stock_flow.get("date")
+        result["note"] = (
+            "Unit is shares, not money. A null window is not fully loaded: report it as unavailable. "
+            "No per-sector net inflow is published for Taiwan."
+        )
+    return result
 
 
 get_capital_flow_tool = ToolDefinition(
